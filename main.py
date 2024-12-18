@@ -9,6 +9,8 @@ from sklearn.model_selection import train_test_split
 from sklearn.linear_model import LogisticRegression
 from sklearn.metrics import accuracy_score
 from streamlit import session_state
+from feature_engine.discretisation import DecisionTreeDiscretiser
+from feature_engine.encoding import DecisionTreeEncoder
 
 
 def session_state_init():
@@ -36,6 +38,10 @@ def session_state_init():
         st.session_state.cols_pred_num = list()
     if 'cols_pred_cat' not in st.session_state:
         st.session_state.cols_pred_cat = list()
+    if 'feat_num_bin' not in st.session_state:
+        st.session_state.feat_num_bin = dict()
+    if 'df_feat_num' not in st.session_state:
+        st.session_state.df_feat_num = None
 
 
 @st.cache_data
@@ -210,16 +216,21 @@ def main():
             num_bin = st.text_input("Number of bin", value='5')
             min_bin_sample = st.text_input("Min sample per bin", value='100')
             if st.button("Generate bin"):
+                st.session_state.df_feat_num, st.session_state.feat_num_bin = automatic_feature_binning(df, st.session_state.cols_pred_num, target_col, int(num_bin), int(min_bin_sample))
+                st.dataframe(st.session_state.df_feat_num)
                 st.session_state.generate_bin = True
-                st.write("Placeholder")
+
 
         if st.session_state.generate_bin:
             st.write("Categorical features")
             num_group = st.text_input("Number of group", value='5')
             min_group_sample = st.text_input("Min sample per group", value='100')
             if st.button("Generate group"):
+                df_feat_cat, feat_cat_group = encode_with_decision_tree(df, st.session_state.cols_feat_cat, target_col, num_group, min_group_sample)
+                st.dataframe(df_feat_cat)
+                st.write(feat_cat_group)
                 st.session_state.generate_group = True
-                st.write("Placeholder")
+
 
         if st.session_state.generate_group:
             st.divider()
@@ -228,6 +239,23 @@ def main():
             cols_feat = st.multiselect("Select feature columns", st.session_state.cols_pred_num + st.session_state.cols_pred_cat)
 
 
+def encode_with_decision_tree(df, categorical_features, target_variable, max_group, min_data_per_group):
+    # Instantiate the encoder
+    encoder = DecisionTreeEncoder(cols=categorical_features,
+                                  param_grid={'max_leaf_nodes': [max_group],  # np.arange(2,max_bins).tolist()
+                                              'min_samples_leaf': [min_data_per_group]}
+                                  )
+
+    # Fit and transform the data
+    df_encoded = encoder.fit_transform(df[categorical_features], df[target_variable])
+
+    # Get the encoder mapping dictionary
+    encoder_dict = encoder.encoder_dict_
+
+    # Combine the encoded columns with the original data (optional)
+    df_transformed = df.drop(columns=categorical_features).join(df_encoded)
+
+    return df_transformed, encoder_dict
 
 def plot_eda_monthly(df, col_time, target_col):
     df_stats = df[[col_time, target_col]].groupby(col_time).agg(['mean', 'count'])[target_col]
@@ -289,6 +317,52 @@ def get_train_mask(df, hoot_th, oot_th, train_perc, test_perc, valid_perc, targe
     df.loc[X_test, 'data_type'] = 'test'
 
     return df
+
+def automatic_feature_binning(df, cols_feat_num, target_col, max_bins, min_data_per_bin):
+    """
+    Perform automatic feature binning using DecisionTreeDiscretiser from feature-engine.
+
+    Parameters:
+    df (pd.DataFrame): The input DataFrame containing numerical features.
+    max_bins (int): Maximum number of bins for each feature.
+    min_data_per_bin (int): Minimum number of data points required per bin.
+
+    Returns:
+    pd.DataFrame: DataFrame with discretized features.
+    dict: Dictionary containing the features and their corresponding bin thresholds.
+    """
+
+    # Instantiate the DecisionTreeDiscretiser (Feature-engine)
+    discretizer = DecisionTreeDiscretiser(
+        variables=cols_feat_num,
+        # Select numeric columns automatically
+        param_grid= {'max_leaf_nodes':[max_bins], #np.arange(2,max_bins).tolist()
+                     'min_samples_leaf':[min_data_per_bin]},
+        bin_output='boundaries', # Return bin labels
+        regression=False,
+        precision=4
+    )
+
+    # Fit and transform the data
+    df_binned = discretizer.fit_transform(df[cols_feat_num], df[target_col])
+
+    # Extract bin thresholds for each feature
+    # bin_thresholds = {feature: discretizer.binner_.bins[feature] for feature in discretizer.variables_}
+    bin_thresholds = discretizer.binner_dict_
+    output_dict = {}
+
+    for feature, thresholds in bin_thresholds.items():
+        # Check if thresholds is a dictionary (original format)
+        if isinstance(thresholds, dict):
+            thresholds_list = [value for key, value in sorted(thresholds.items())]
+        elif isinstance(thresholds, list):  # Handle if the value is already a list
+            thresholds_list = thresholds
+        else:
+            raise ValueError("Input data must be in dictionary or list format.")
+
+        output_dict[feature] = thresholds_list
+        print(thresholds_list)
+    return df_binned, output_dict
 
 
     # Model training and evaluation
