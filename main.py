@@ -3,6 +3,8 @@ import pandas as pd
 import numpy as np
 import matplotlib.pyplot as plt
 from matplotlib.ticker import FuncFormatter
+import seaborn as sns
+import ast
 
 from IPython.testing.decorators import skipif
 from sklearn.model_selection import train_test_split
@@ -11,6 +13,7 @@ from sklearn.metrics import accuracy_score
 from streamlit import session_state
 from feature_engine.discretisation import DecisionTreeDiscretiser
 from feature_engine.encoding import DecisionTreeEncoder
+from feature_engine.encoding import WoEEncoder
 
 
 def session_state_init():
@@ -42,6 +45,16 @@ def session_state_init():
         st.session_state.feat_num_bin = dict()
     if 'df_feat_num' not in st.session_state:
         st.session_state.df_feat_num = None
+    if 'generated_bin_btn' not in st.session_state:
+        st.session_state.generated_bin_btn = False
+    if 'df_feat_cat' not in st.session_state:
+        st.session_state.df_feat_cat = False
+    if 'feat_cat_group' not in st.session_state:
+        st.session_state.feat_cat_group = False
+    if 'confirm_feature' not in st.session_state:
+        st.session_state.confirm_feature = False
+    if 'confirm_manual_binning' not in st.session_state:
+        st.session_state.confirm_manual_binning = True
 
 
 @st.cache_data
@@ -97,9 +110,9 @@ def preprocess_data(df, target_col, feature_cols, timestamp_col):
 
     cols_pred_num = df[feature_cols].select_dtypes('number').columns.tolist()
     cols_pred_cat = df[feature_cols].select_dtypes('object').columns.tolist()
-
     display_col = list(set([target_col] + feature_cols + [timestamp_col, 'month', 'day']))
-
+    df[cols_pred_num] = df[cols_pred_num].fillna(-9999)
+    df[cols_pred_cat] = df[cols_pred_cat].fillna('NA')
     df = df[display_col]
 
     return df, cols_pred_num, cols_pred_cat, arr_month, arr_day
@@ -107,7 +120,7 @@ def preprocess_data(df, target_col, feature_cols, timestamp_col):
 def select_slider_opt(arr_month):
     arr_perc = list(range(1, 100))
     hoot_th, oot_th = st.select_slider("Select hoot and oot threshold", options=arr_month, value=(arr_month[0], arr_month[-1]))
-    train_perc = st.select_slider("Train sample in %", options=arr_perc)
+    train_perc = st.select_slider("Train sample in %", options=arr_perc, value=50)
     test_perc_init = 100-train_perc
     arr_perc_test = list(range(1, test_perc_init+1))
     test_perc = st.select_slider("Test sample in %", options=arr_perc_test, value=test_perc_init//2)
@@ -153,21 +166,29 @@ def main():
 
     if uploaded_file is not None:
         df = load_data(uploaded_file)
+        df['category'] = np.random.choice(['A', 'B', 'C', 'D', 'F', 'G', 'H'], size=len(df))
+        df['category2'] = np.random.choice(['AA', 'BA', 'CD'], size=len(df))
+
         st.session_state.input_data = True
 
         # Select columns
     if st.session_state.input_data:
         st.divider()
         st.header("Metadata")
-        target_col = st.selectbox("Select target column", df.columns)
+
+        # get binary column
+        binary_columns = [col for col in df.columns if df[col].nunique() == 2]
+
+        target_col = st.selectbox("Select target column", binary_columns)
         feature_cols = st.multiselect("Select feature columns", df.columns)
-        timestamp_col = st.selectbox("Select timestamp column", df.columns)
+        timestamp_col = st.selectbox("Select timestamp column", df.select_dtypes('object').columns.tolist() + df.select_dtypes(include=['datetime', 'datetime64']).columns.tolist())
 
         if st.button("Confirm Metadata"):
             df = check_valid_df(df, target_col, feature_cols, timestamp_col)
             df.to_parquet("dataframe.parquet")
             if 'df' not in st.session_state:
                 st.session_state.df = df.copy()
+                st.session_state.target_col = target_col
 
 
      # Display preprocessed data
@@ -201,49 +222,287 @@ def main():
             st.session_state.df = df
             st.session_state.confirm_split = True
 
-        if st.session_state.confirm_split:
-            st.divider()
-            st.header("Exploration Data Analysis")
-            st.write("Monthly ODR")
-            plot_eda_monthly(df, 'month', target_col)
-            st.write("Feature statistics")
-            st.dataframe(df[feature_cols].describe().transpose())
+    if st.session_state.confirm_split:
+        st.divider()
+        st.header("Exploration Data Analysis")
+        st.write("Monthly ODR")
+        plot_eda_monthly(df, 'month', target_col)
+        st.write("Feature statistics")
+        st.dataframe(df[feature_cols].describe().transpose())
 
-            # Automatic binning
-            st.divider()
-            st.header("Automatic Binning and Grouping")
-            st.write("Numerical features")
-            num_bin = st.text_input("Number of bin", value='5')
-            min_bin_sample = st.text_input("Min sample per bin", value='100')
-            if st.button("Generate bin"):
-                st.session_state.df_feat_num, st.session_state.feat_num_bin = automatic_feature_binning(df, st.session_state.cols_pred_num, target_col, int(num_bin), int(min_bin_sample))
-                st.dataframe(st.session_state.df_feat_num)
-                st.session_state.generate_bin = True
+        # Automatic binning
+        st.divider()
+        st.header("Automatic Binning and Grouping")
+        st.write("Numerical features")
+        num_bin = st.text_input("Number of bin", value='3')
+        min_bin_sample = st.text_input("Min sample per bin", value='100')
+        st.write("Categorical features")
+        num_group = st.text_input("Number of group", value='3')
+        min_group_sample = st.text_input("Min sample per group", value='100')
+
+        if st.button("Generate Automatic WoE"):
+            df_used = df.loc[df['data_type']=='train'].copy()
+            st.session_state.df_feat_num, st.session_state.feat_num_bin = automatic_feature_binning(df_used, st.session_state.cols_pred_num, target_col, int(num_bin), int(min_bin_sample))
+            st.session_state.df_feat_num, st.session_state.woe_dict, st.session_state.woe_encoder_num = (
+                calculate_woe(df_used, st.session_state.cols_pred_num, target_col, st.session_state.feat_num_bin))
+            st.session_state.df_feat_cat, st.session_state.feat_cat_group, st.session_state.dt_encoder = (
+                encode_with_decision_tree(df_used, st.session_state.cols_pred_cat, target_col, int(num_group),
+                                          int(min_group_sample)))
+            st.session_state.df_feat_cat, st.session_state.woe_dict_group, st.session_state.woe_encoder_cat = (
+                calculate_woe(df_used, st.session_state.cols_pred_cat, target_col))
+            st.session_state.generate_bin = True
+
+    if st.session_state.generate_bin:
+        st.subheader("Woe for numerical and categorical feature")
+        st.dataframe(st.session_state.df_feat_num)
+        st.dataframe(st.session_state.df_feat_cat)
+
+        st.divider()
+        st.header("Feature Selection")
+        st.write("Information values in train data:")
+        df_train = st.session_state.df_feat_num.merge(st.session_state.df_feat_cat, left_index=True, right_index=True, how='left')
+        df_train[target_col] = df.loc[df['data_type']=='train', target_col].values
+        st.session_state.df_train = df_train.copy()
+        iv_dict = calculate_iv(st.session_state.df_train, st.session_state.df_train, target_col)
+        st.dataframe(iv_dict)
+        initial_corr_col = iv_dict.index.tolist()[:2]
+        cols_feat = st.multiselect("Select feature columns used for modelling",
+                                   iv_dict.index.tolist(),
+                                   default=initial_corr_col)
+        corr_selected_feature = df_train[cols_feat].corr()
+        corr_fig = display_corr(corr_selected_feature)
+        st.subheader("Feature correlation")
+        st.pyplot(corr_fig)
+        st.write("CONFIRM FEATURES SELECTION, PRESS BUTTON TO PROCEED AND CLEAR MEMORIES")
+        st.write("Note: You need to start from the beggining if you decided to change the feature selection")
+        if st.button("Confirm Features!"):
+            del df_stats, df_train
+            # df.to_parquet('dataframe.parquet')
+            st.session_state.df = df
+            st.session_state.corr_selected_feature = corr_selected_feature.columns.tolist()
+            st.session_state.confirm_feature = True
+
+    if st.session_state.confirm_feature:
+        st.divider()
+        st.header("Manual WoE Setting")
+        option = st.selectbox(
+            "Choose feature",
+            st.session_state.corr_selected_feature
+        )
+
+        st.write("You selected:", option)
+        st.write("Fine tune your bin")
+        tune_woe(option)
+        if st.button("Confirm manual binning"):
+            st.session_state.confirm_manual_binning = True
+
+    if st.session_state.confirm_manual_binning:
+        st.divider()
+        st.header("Modelling")
+        st.write("Placeholder")
+        calculate_woe_all()
 
 
-        if st.session_state.generate_bin:
-            st.write("Categorical features")
-            num_group = st.text_input("Number of group", value='5')
-            min_group_sample = st.text_input("Min sample per group", value='100')
-            if st.button("Generate group"):
-                df_feat_cat, feat_cat_group = encode_with_decision_tree(df, st.session_state.cols_feat_cat, target_col, num_group, min_group_sample)
-                st.dataframe(df_feat_cat)
-                st.write(feat_cat_group)
-                st.session_state.generate_group = True
+def calculate_woe_all():
+    # Initialize a dictionary to hold WoE for each feature
+
+    thresholds = st.session_state.feat_num_bin
+    dict_group = st.session_state.feat_cat_group
+    features_num = st.session_state.cols_feat_num
+    features_cat = st.session_state.cols_feat_cat
+    target_col = st.session_state.target_col
+    woe_dict_num = st.session_state.woe_dict
+    woe_dict_group = st.session_state.woe_dict_group
+
+    st.write(dict_group)
+    st.write(woe_dict_group)
+
+    # Loop over each feature
+    # if thresholds is not None:
+    #     for feature in features_num:
+    #         # Get the threshold for the current feature
+    #         threshold = thresholds[feature]
+    #         woe_df[feature] = pd.cut(df[feature], threshold, labels=False)
+    #         woe_df[feature] = woe_df[feature].fillna(-9999)
+    #         woe_df[feature] = woe_df[feature].astype('object')
+    #
+    # else:
+    #     for feature in features_cat:
+    #         dict_transformer = st.session_state.feat_cat_group[feature]
+    #         woe_df[feature] = df[feature].map(dict_transformer)
+    #         woe_df[feature] = woe_df[feature].fillna('-9999')
+    #         woe_df[feature] = woe_df[feature].astype('object')
+    #
+    # woe_encoder = st.session_state.woe_encoder_num
+    # woe_df[features_num] = woe_encoder.transform(woe_df[features_num], df[target_col])
+    #
+    # return woe_df, woe_encoder.encoder_dict_, woe_encoder
 
 
-        if st.session_state.generate_group:
-            st.divider()
-            st.header("Feature Selection")
-            st.write("Placeholder")
-            cols_feat = st.multiselect("Select feature columns", st.session_state.cols_pred_num + st.session_state.cols_pred_cat)
+def tune_woe(option):
+    df_used = st.session_state.df
+    try:
+        df_used = df_used.loc[df_used.data_type.isin(['train', 'valid'])].copy()
+    except:
+        df_used = df_used.loc[df_used.data_type=='train'].copy()
 
+    st.session_state.cols_feat_num = df_used[st.session_state.corr_selected_feature].select_dtypes(
+        'number').columns.tolist()
+    st.session_state.cols_feat_cat = df_used[st.session_state.corr_selected_feature].select_dtypes(
+        'object').columns.tolist()
+
+    if option in st.session_state.cols_feat_num:
+        bin_new = st.text_input("Number of bin", value=st.session_state.feat_num_bin[option])
+        bin_new = fix_bin(bin_new)
+        st.session_state.feat_num_bin[option] = bin_new
+        grouped = calculate_woe_feature_num(df_used, option, st.session_state.target_col, bin_new)
+
+
+    elif option in st.session_state.cols_feat_cat:
+        bin_new = st.text_input("Number of bin", value=st.session_state.feat_cat_group[option])
+        bin_new = ast.literal_eval(bin_new)
+        st.session_state.feat_cat_group[option] = bin_new
+        grouped = calculate_woe_feature_cat(df_used, option, st.session_state.target_col, bin_new)
+
+    st.dataframe(grouped)
+
+
+def calculate_woe_feature_cat(df, feature, target, transform_dict):
+    # Create bins based on the threshold
+    df['binned_feature'] = df[feature].map(transform_dict)
+
+
+    # Calculate the total number of good (target == 0) and bad (target == 1) cases
+    good_total = df[df[target] == 0].shape[0]  # Total good outcomes (target = 0)
+    bad_total = df[df[target] == 1].shape[0]  # Total bad outcomes (target = 1)
+
+    # Group by the binned feature and calculate the distribution of good and bad outcomes
+    grouped = df.groupby(['data_type', 'binned_feature'])[target].agg(['sum', 'count'])
+
+    # Calculate the number of good and bad outcomes in each bin
+    grouped['good'] = (grouped['count'] - grouped['sum']) / good_total  # Distribution of good outcomes
+    grouped['bad'] = grouped['sum'] / bad_total  # Distribution of bad outcomes
+    grouped['bad rate'] = grouped['sum'] / grouped['count']
+
+    # Calculate WoE for each bin (bin values 0 and 1)
+    grouped['WoE'] = np.log(grouped['good'] / grouped['bad'])
+
+    # Print the WoE values
+    return grouped[['good', 'bad', 'sum', 'count', 'bad rate', 'WoE']]
+
+def calculate_woe_feature_num(df, feature, target, threshold):
+    # Create bins based on the threshold
+    df['binned_feature'] = pd.cut(df[feature], threshold)
+    df['binned_feature'] = df['binned_feature'].astype('object')
+
+    # Calculate the total number of good (target == 0) and bad (target == 1) cases
+    good_total = df[df[target] == 0].shape[0]  # Total good outcomes (target = 0)
+    bad_total = df[df[target] == 1].shape[0]  # Total bad outcomes (target = 1)
+
+    # Group by the binned feature and calculate the distribution of good and bad outcomes
+    grouped = df.groupby(['data_type','binned_feature'])[target].agg(['sum', 'count'])
+
+    # Calculate the number of good and bad outcomes in each bin
+    grouped['good'] = (grouped['count'] - grouped['sum']) / good_total  # Distribution of good outcomes
+    grouped['bad'] = grouped['sum'] / bad_total  # Distribution of bad outcomes
+    grouped['bad rate'] = grouped['sum'] / grouped['count']
+
+    # Calculate WoE for each bin (bin values 0 and 1)
+    grouped['WoE'] = np.log(grouped['good'] / grouped['bad'])
+
+    # Print the WoE values
+    return grouped[['good', 'bad', 'sum', 'count', 'bad rate', 'WoE']]
+
+def fix_bin(bin_list):
+    txt_list = bin_list.split(",")
+    bin_list = list(map(float, txt_list[1:-1]))
+    return [-np.inf] + bin_list + [np.inf]
+
+
+def display_corr(corr):
+    plt.figure(figsize=(8, 6))
+    sns.set(font_scale=1.2)  # Adjust font size
+    ax = sns.heatmap(corr, annot=True, fmt='.2%', cmap='coolwarm', center=0, cbar=True,
+                     xticklabels=corr.columns, yticklabels=corr.columns, annot_kws={'size': 12})
+
+    # Set title
+    plt.title('Feature Correlation Heatmap')
+    return plt
+
+
+def calculate_iv(df, col_features, target_col):
+    # Example usage:
+    # df: DataFrame with your WoE features and a binary target column 'target' where 1 = default and 0 = non-default
+    # target_col: the column name of the binary target variable (e.g., 'target')
+    # Assuming df contains the WoE features and a binary target column
+    # iv_values = calculate_iv(df, 'target')
+    # print(iv_values)
+
+    iv_dict = {}
+
+    # Loop through each feature (skip the target column)
+    for column in col_features:
+        # Skip the target column
+        if column == target_col:
+            continue
+
+        # Calculate the distribution of good (1) and bad (0) for each bin (WoE feature)
+        good_total = df[df[target_col] == 1].shape[0]
+        bad_total = df[df[target_col] == 0].shape[0]
+
+        # Group by the WoE values and calculate the distribution of good/bad for each bin
+        grouped = df.groupby(column).agg({target_col: ['sum', 'count']})
+
+        # Calculate the distribution of good and bad for each bin
+        grouped['good'] = grouped[target_col]['sum'] / good_total
+        grouped['bad'] = (grouped[target_col]['count'] - grouped[target_col]['sum']) / bad_total
+
+        # Calculate the WoE for each bin
+        grouped['WoE'] = np.log(grouped['good'] / grouped['bad'])
+
+        # Calculate IV for the feature
+        grouped['IV'] = (grouped['good'] - grouped['bad']) * grouped['WoE']
+
+        # Sum up the IV for each feature
+        iv_dict[column] = grouped['IV'].sum()
+        iv_dict = pd.Series(iv_dict, name='Information Values')
+
+    return iv_dict.sort_values(ascending=False)
+
+
+def calculate_woe(df, features, target_col, thresholds=None):
+    # Initialize a dictionary to hold WoE for each feature
+    woe_df = pd.DataFrame()
+
+    # Loop over each feature
+    if thresholds is not None:
+        for feature in features:
+            # Get the threshold for the current feature
+            threshold = thresholds[feature]
+            woe_df[feature] = pd.cut(df[feature], threshold,labels=False)
+            woe_df[feature] = woe_df[feature].fillna(-9999)
+            woe_df[feature] = woe_df[feature].astype('object')
+
+    else:
+        for feature in features:
+            dict_transformer = st.session_state.feat_cat_group[feature]
+            woe_df[feature] = df[feature].map(dict_transformer)
+            woe_df[feature] = woe_df[feature].fillna('-9999')
+            woe_df[feature] = woe_df[feature].astype('object')
+
+
+    woe_encoder = WoEEncoder()
+    df_transformed = woe_encoder.fit_transform(woe_df[features], df[target_col])
+    del woe_df
+    return df_transformed, woe_encoder.encoder_dict_, woe_encoder
 
 def encode_with_decision_tree(df, categorical_features, target_variable, max_group, min_data_per_group):
     # Instantiate the encoder
-    encoder = DecisionTreeEncoder(cols=categorical_features,
+    encoder = DecisionTreeEncoder(variables=categorical_features,
                                   param_grid={'max_leaf_nodes': [max_group],  # np.arange(2,max_bins).tolist()
-                                              'min_samples_leaf': [min_data_per_group]}
+                                              'min_samples_leaf': [min_data_per_group]},
+                                  regression=False,
+                                  encoding_method='ordered'
                                   )
 
     # Fit and transform the data
@@ -252,10 +511,27 @@ def encode_with_decision_tree(df, categorical_features, target_variable, max_gro
     # Get the encoder mapping dictionary
     encoder_dict = encoder.encoder_dict_
 
-    # Combine the encoded columns with the original data (optional)
-    df_transformed = df.drop(columns=categorical_features).join(df_encoded)
+    # build new encoder
+    dict_new = dict.fromkeys(encoder_dict.keys())
 
-    return df_transformed, encoder_dict
+    for feature in encoder_dict.keys():
+        dict_temp = {}
+        arr_ = list()
+
+        for value in encoder_dict[feature]:
+            arr_.append(encoder_dict[feature][value])
+
+        arr_.sort()
+        arr_ = list(set(arr_))
+
+        for value in encoder_dict[feature]:
+            dict_temp[value] = arr_.index(encoder_dict[feature][value])
+
+        dict_new[feature] = dict_temp
+        df_encoded[feature] = df[feature].map(dict_temp)
+
+    # Combine the encoded columns with the original data (optional)
+    return df_encoded, dict_new, encoder
 
 def plot_eda_monthly(df, col_time, target_col):
     df_stats = df[[col_time, target_col]].groupby(col_time).agg(['mean', 'count'])[target_col]
@@ -265,11 +541,12 @@ def plot_eda_monthly(df, col_time, target_col):
     fig, ax1 = plt.subplots(figsize=(8, 6))
 
     x_axis = np.arange(1, len(df_stats['month'])+1)
-    x_ticklabels = ['0'] + pd.to_datetime(df_stats['month'], format='%Y%m').dt.strftime('%Y-%m').values.tolist()
+    x_ticklabels = pd.to_datetime(df_stats['month'], format='%Y%m').dt.strftime('%Y-%m').values.tolist()
 
 
     # Plot bar chart (left y-axis) with 'data count'
     ax1.bar(x_axis, df_stats['data count'], color='blue', label='Data Count')
+    ax1.set_xticks(x_axis)
     ax1.set_xticklabels(x_ticklabels, rotation=45)
     ax1.set_xlabel('Month')
     ax1.set_ylabel('Data Count', color='blue')
