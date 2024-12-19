@@ -293,50 +293,93 @@ def main():
         st.write("You selected:", option)
         st.write("Fine tune your bin")
         tune_woe(option)
-        if st.button("Confirm manual binning"):
+        if st.button("Prepare data for modelling"):
             st.session_state.confirm_manual_binning = True
 
     if st.session_state.confirm_manual_binning:
         st.divider()
         st.header("Modelling")
-        st.write("Placeholder")
-        calculate_woe_all()
+        st.write("Transformed data")
+        df = calculate_woe_all(st.session_state.df)
+        st.dataframe(st.session_state.df)
+
+        st.subheader("Hyperparameter tuning")
+        st.header("Evaluation")
+        st.header("Script generation")
 
 
-def calculate_woe_all():
+
+
+
+def calculate_woe(df, features, target_col, thresholds=None):
     # Initialize a dictionary to hold WoE for each feature
+    woe_df = pd.DataFrame()
 
+    # Loop over each feature
+    if thresholds is not None:
+        for feature in features:
+            # Get the threshold for the current feature
+            threshold = thresholds[feature]
+            woe_df[feature] = pd.cut(df[feature], threshold,labels=False)
+            woe_df[feature] = woe_df[feature].fillna(-9999)
+            woe_df[feature] = woe_df[feature].astype('object')
+
+    else:
+        for feature in features:
+            dict_transformer = st.session_state.feat_cat_group[feature]
+            woe_df[feature] = df[feature].map(dict_transformer)
+            woe_df[feature] = woe_df[feature].fillna('-9999')
+            woe_df[feature] = woe_df[feature].astype('object')
+
+    woe_encoder = WoEEncoder()
+    df_transformed = woe_encoder.fit_transform(woe_df[features], df[target_col])
+    del woe_df
+    return df_transformed, woe_encoder.encoder_dict_, woe_encoder
+
+
+def calculate_woe_all(df):
+    train_mask = (df.data_type=='train')
+
+    # Initialize a dictionary to hold WoE for each feature
     thresholds = st.session_state.feat_num_bin
     dict_group = st.session_state.feat_cat_group
     features_num = st.session_state.cols_feat_num
     features_cat = st.session_state.cols_feat_cat
     target_col = st.session_state.target_col
-    woe_dict_num = st.session_state.woe_dict
-    woe_dict_group = st.session_state.woe_dict_group
 
-    st.write(dict_group)
-    st.write(woe_dict_group)
+    woe_df = pd.DataFrame()
 
     # Loop over each feature
-    # if thresholds is not None:
-    #     for feature in features_num:
-    #         # Get the threshold for the current feature
-    #         threshold = thresholds[feature]
-    #         woe_df[feature] = pd.cut(df[feature], threshold, labels=False)
-    #         woe_df[feature] = woe_df[feature].fillna(-9999)
-    #         woe_df[feature] = woe_df[feature].astype('object')
-    #
-    # else:
-    #     for feature in features_cat:
-    #         dict_transformer = st.session_state.feat_cat_group[feature]
-    #         woe_df[feature] = df[feature].map(dict_transformer)
-    #         woe_df[feature] = woe_df[feature].fillna('-9999')
-    #         woe_df[feature] = woe_df[feature].astype('object')
-    #
-    # woe_encoder = st.session_state.woe_encoder_num
-    # woe_df[features_num] = woe_encoder.transform(woe_df[features_num], df[target_col])
-    #
-    # return woe_df, woe_encoder.encoder_dict_, woe_encoder
+
+    for feature in features_num:
+        # Get the threshold for the current feature
+        threshold = thresholds[feature]
+        woe_df[feature] = pd.cut(df[feature], threshold, labels=False)
+        woe_df[feature] = woe_df[feature].astype('object')
+
+    woe_encoder = WoEEncoder()
+    woe_encoder.fit(woe_df.loc[train_mask, features_num], df.loc[train_mask, target_col])
+    woe_df_num = woe_encoder.transform(woe_df[features_num])
+
+    woe_df = pd.DataFrame()
+    for feature in features_cat:
+        woe_df[feature] = df[feature].map(dict_group[feature])
+        woe_df[feature] = woe_df[feature].astype('object')
+
+    woe_encoder = WoEEncoder()
+    woe_encoder.fit(woe_df.loc[train_mask, features_cat], df.loc[train_mask, target_col])
+    woe_df_cat = woe_encoder.transform(woe_df[features_cat])
+
+    for icol in woe_df_num.columns:
+        woe_df_num = woe_df_num.rename(columns={icol: icol+"_woe"})
+
+    for icol in woe_df_cat.columns:
+        woe_df_cat = woe_df_cat.rename(columns={icol: icol+"_woe"})
+
+    df = df.merge(woe_df_num, left_index=True, right_index=True, how='left').merge(woe_df_cat, left_index=True, right_index=True, how='left')
+    return df
+
+
 
 
 def tune_woe(option):
@@ -469,32 +512,6 @@ def calculate_iv(df, col_features, target_col):
 
     return iv_dict.sort_values(ascending=False)
 
-
-def calculate_woe(df, features, target_col, thresholds=None):
-    # Initialize a dictionary to hold WoE for each feature
-    woe_df = pd.DataFrame()
-
-    # Loop over each feature
-    if thresholds is not None:
-        for feature in features:
-            # Get the threshold for the current feature
-            threshold = thresholds[feature]
-            woe_df[feature] = pd.cut(df[feature], threshold,labels=False)
-            woe_df[feature] = woe_df[feature].fillna(-9999)
-            woe_df[feature] = woe_df[feature].astype('object')
-
-    else:
-        for feature in features:
-            dict_transformer = st.session_state.feat_cat_group[feature]
-            woe_df[feature] = df[feature].map(dict_transformer)
-            woe_df[feature] = woe_df[feature].fillna('-9999')
-            woe_df[feature] = woe_df[feature].astype('object')
-
-
-    woe_encoder = WoEEncoder()
-    df_transformed = woe_encoder.fit_transform(woe_df[features], df[target_col])
-    del woe_df
-    return df_transformed, woe_encoder.encoder_dict_, woe_encoder
 
 def encode_with_decision_tree(df, categorical_features, target_variable, max_group, min_data_per_group):
     # Instantiate the encoder
