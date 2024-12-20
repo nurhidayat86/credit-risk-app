@@ -5,15 +5,15 @@ import matplotlib.pyplot as plt
 from matplotlib.ticker import FuncFormatter
 import seaborn as sns
 import ast
-
-from IPython.testing.decorators import skipif
+from datetime import datetime
 from sklearn.model_selection import train_test_split
-from sklearn.linear_model import LogisticRegression
-from sklearn.metrics import accuracy_score
-from streamlit import session_state
 from feature_engine.discretisation import DecisionTreeDiscretiser
 from feature_engine.encoding import DecisionTreeEncoder
 from feature_engine.encoding import WoEEncoder
+from sklearn.linear_model import LogisticRegression
+from sklearn.model_selection import GridSearchCV, StratifiedKFold
+from sklearn.preprocessing import StandardScaler
+from sklearn.metrics import roc_auc_score
 
 
 def session_state_init():
@@ -54,7 +54,18 @@ def session_state_init():
     if 'confirm_feature' not in st.session_state:
         st.session_state.confirm_feature = False
     if 'confirm_manual_binning' not in st.session_state:
-        st.session_state.confirm_manual_binning = True
+        st.session_state.confirm_manual_binning = False
+    if 'df' not in st.session_state:
+        st.session_state.df = pd.DataFrame()
+    if 'target_col' not in st.session_state:
+        st.session_state.target_col = 'False'
+    if 'scorecard_df' not in st.session_state:
+        st.session_state.scorecard_df = None
+    if 'eval_score' not in st.session_state:
+        st.session_state.eval_score = None
+    if 'sc_table' not in st.session_state:
+        st.session_state.sc_table = None
+
 
 
 @st.cache_data
@@ -153,12 +164,20 @@ def check_valid_df(df, target_col, feature_cols, timestamp_col):
             st.session_state.processed_data = True
             st.session_state.cols_pred_num = cols_pred_num
             st.session_state.cols_pred_cat = cols_pred_cat
+            st.session_state.df = df
             return df
 
 def main():
     session_state_init()
 
-    st.title("Fast Logistic Regression Modeller")
+    st.title("Credit Risk Express: Ver. 1e-10")
+    st.write("""Simple logistic regression based scorecard modeller\n
+    Features:\n
+    1. IV & correlation based feature selection\n
+    2. L2 hyperparameter tuning\n
+    3. SQL producer\n
+    Use CSV or PARQUET file format: a column containing timestamp and \n
+    binary label (0,1) information must be present in the dataset.""")
 
     # 1. Data Input
     st.header("Data Input")
@@ -218,7 +237,6 @@ def main():
 
         if st.button("Confirm Splitting"):
             del df_stats
-            # df.to_parquet('dataframe.parquet')
             st.session_state.df = df
             st.session_state.confirm_split = True
 
@@ -277,10 +295,10 @@ def main():
         st.write("Note: You need to start from the beggining if you decided to change the feature selection")
         if st.button("Confirm Features!"):
             del df_stats, df_train
-            # df.to_parquet('dataframe.parquet')
             st.session_state.df = df
             st.session_state.corr_selected_feature = corr_selected_feature.columns.tolist()
             st.session_state.confirm_feature = True
+            st.session_state.target_col = target_col
 
     if st.session_state.confirm_feature:
         st.divider()
@@ -298,17 +316,256 @@ def main():
 
     if st.session_state.confirm_manual_binning:
         st.divider()
-        st.header("Modelling")
-        st.write("Transformed data")
-        df = calculate_woe_all(st.session_state.df)
-        st.dataframe(st.session_state.df)
 
-        st.subheader("Hyperparameter tuning")
+        df, woe_cols = calculate_woe_all(st.session_state.df)
+        st.session_state.df = df.copy()
+        st.session_state.woe_cols = woe_cols
+
+        st.header("Hyperparameter tuning")
+        st.write("Learning Journey")
+        if 'valid' in df.columns:
+            best_model, best_param, summary_df = tune_logistic_regression(df.loc[df['data_type'].isin(['train', 'valid'])],
+                                                              st.session_state.woe_cols, st.session_state.target_col,
+                                                              n_folds=5)
+        else:
+            best_model, best_param, summary_df = tune_logistic_regression(df.loc[df['data_type'] == 'train'],
+                                                              st.session_state.woe_cols, st.session_state.target_col,
+                                                              n_folds=5)
+        st.dataframe(summary_df)
+        st.write("Best parameter")
+        st.write(best_param)
+        st.write(f"""Stats:\n
+        Best model Coefficient: {best_model.coef_}\n
+        Best model Intercept: {best_model.intercept_}\n
+        Feature columns: {st.session_state.woe_cols}""")
+        st.divider()
+        st.header("Scorecards")
+        st.write("Set your scorecard conversion")
+        pdo = st.text_input("PDO", value=20)
+        base_odd = st.text_input("Base odd (X:1)", value=50)
+        base_score = st.text_input("Score at base odd", value=300)
+
+        # Assuming 'log_reg_model' is your trained LogisticRegression model and 'feature_columns' is your list of feature names
+        scorecard_df = logistic_to_scorecard(df[st.session_state.woe_cols],
+                                             best_model,
+                                             st.session_state.woe_cols,
+                                             pdo=int(pdo),
+                                             base_odd=int(base_odd),
+                                             base_score=int(base_score))
+
+        st.subheader("Scorecard table")
+        st.dataframe(scorecard_df)
+        st.session_state.df = df.copy()
+
+        if st.button("Evaluate Score!"):
+
+            st.session_state.scorecard_df = scorecard_df
+            st.session_state.eval_score = True
+            df = score_row(df, st.session_state.scorecard_df, st.session_state.woe_cols)
+            st.session_state.df = df
+
+    if st.session_state.eval_score:
+        st.divider()
         st.header("Evaluation")
-        st.header("Script generation")
+        st.write("Prediction sample")
+        st.dataframe(st.session_state.df.head())
+        df_summary = calculate_auc_roc(st.session_state.df, 'score', st.session_state.target_col, 'data_type')
+        st.write("AUC summary")
+        st.dataframe(df_summary)
+
+        st.divider()
+        st.header("Production script")
+        st.write("Final score card")
+        sc_table = generate_sc_table()
+        st.session_state.sc_table = sc_table
+        st.dataframe(sc_table)
+        your_table = st.text_input("Table Name", value="my_table")
+        customer_id = st.text_input("Customer id", value="customer_id")
+        score_date = st.text_input("Score datetime", value="score_date")
+        query = generate_sql_query(sc_table, your_table,  customer_id, score_date)
+        st.code(query)
 
 
+def generate_sql_query(df, table_name, customer_id, score_date):
+    sql_queries = []
 
+    # Loop through the DataFrame to create CASE WHEN statements
+    case_when_num = ""
+    for ifeat in st.session_state.cols_feat_num:
+        df_used = df.loc[df["Feature"]==ifeat,:]
+
+        case_when_num += f"CASE\n"
+
+        for index, row in df_used.iterrows():
+            bin_condition = row['Bin']
+            points = row['Points']
+
+            if '-inf' in bin_condition:
+                bin_condition = bin_condition.replace('-inf', '-999999999')
+            if 'inf' in bin_condition:
+                bin_condition = bin_condition.replace('inf', '999999999')
+            bin_parts = bin_condition.strip('()[]').split(',')
+            lower_bound = bin_parts[0].strip()
+            upper_bound = bin_parts[1].strip()
+
+            case_when_num += f"WHEN {ifeat} > {lower_bound} AND {ifeat} <= {upper_bound} THEN {points}\n"
+
+        case_when_num += f"END AS {ifeat}_score,\n"
+
+    for ifeat in st.session_state.cols_feat_cat:
+        df_used = df.loc[df["Feature"] == ifeat, :]
+
+        case_when_num += f"CASE\n"
+
+        for index, row in df_used.iterrows():
+            bin_condition = row['Bin']
+            points = row['Points']
+
+            case_when_num += f"WHEN {ifeat} = '{bin_condition}' THEN {points}\n"
+
+        case_when_num += f"END AS {ifeat}_score,\n"
+
+    # Combine the SQL queries into a final SELECT statement
+    sql_queries = f"WITH temp AS (\nSELECT\n{customer_id},\n{datetime.now().strftime('%Y-%m-%d')} AS {score_date},\n" + case_when_num[:-2] + f"\nFROM {table_name}\n)\n\n"
+
+    total_score = "( "
+    for ichar in [f"{feature}_score +\n" for feature in df["Feature"].unique()]: total_score += ichar
+
+    final_sql = sql_queries + "SELECT\n*,\n" + total_score[:-2] + ") AS total_score \nFROM temp;"
+
+    return final_sql
+
+def generate_sc_table():
+    df_mapper = st.session_state.scorecard_df
+    df_mapper['Attribute'] = df_mapper['Attribute'].round(4)
+    swap_dict_cat = dict()
+    for ikey in st.session_state.feat_cat_group.keys():
+        dict_temp = {}
+        for jkey in st.session_state.feat_cat_group[ikey].keys():
+            dict_temp[jkey] = st.session_state.woe_dict_group[ikey][str(st.session_state.feat_cat_group[ikey][jkey])]
+        swap_dict_cat[ikey] = dict_temp
+
+    sc_content = []
+    for ifeat in st.session_state.cols_feat_num:
+        # st.write(ifeat)
+        for jfeat in st.session_state.woe_dict[ifeat].keys():
+            jwoe = np.round(st.session_state.woe_dict[ifeat][jfeat], 4)
+            contain = [ifeat, jfeat] + df_mapper.loc[(df_mapper['Feature']==ifeat+"_woe") & (df_mapper['Attribute'] == jwoe),["Weight", "Attribute", "Points"]].values.tolist()[0]
+            sc_content.append(contain)
+
+    for ifeat in st.session_state.cols_feat_cat:
+        for jfeat in swap_dict_cat[ifeat].keys():
+            jwoe = np.round(swap_dict_cat[ifeat][jfeat], 4)
+            contain = [ifeat, jfeat] + df_mapper.loc[(df_mapper['Feature']==ifeat+"_woe") & (df_mapper['Attribute'] == jwoe),["Weight", "Attribute", "Points"]].values.tolist()[0]
+            sc_content.append(contain)
+
+    sc_content = pd.DataFrame(sc_content, columns=["Feature", "Bin", "Weight", "Attribute", "Points"])
+    return sc_content
+
+def score_row(df, scorecard_df, feature_columns):
+    df['score'] = 0
+    for icol in feature_columns:
+        mapper = scorecard_df.loc[scorecard_df['Feature']==icol, ["Attribute", "Points"]]
+        mapper_dict = pd.Series(mapper['Points'].values, index=mapper['Attribute'])
+        df['score'] += df[icol].map(mapper_dict)
+    return df
+
+def calculate_auc_roc(df, score_column, target_column, groupby_column):
+    auc_scores = {}
+
+    # Group by the 'data_type' column
+    grouped = df.groupby(groupby_column)
+
+    def calc_auc(y, x):
+        auc = roc_auc_score(y, x)
+        if auc < 0.5: auc=1-auc
+        return auc
+
+    for group_name, group_data in grouped:
+        # Calculate the AUC-ROC score for each group
+        auc = calc_auc(group_data[target_column], group_data[score_column])
+        auc_scores[group_name] = auc
+
+    return auc_scores
+
+def logistic_to_scorecard(df, model, feature_names, pdo=20, base_odd=50, base_score=300):
+    """
+    Converts a trained logistic regression model to a credit risk scorecard.
+
+    Args:
+        model: Trained scikit-learn LogisticRegression model.
+        feature_names: List of feature names corresponding to the model coefficients.
+        pdo: Points to Double the Odds (e.g., 20 means a 20-point increase doubles the odds).
+        base_odds: The odds at the base score.
+        base_score: Score at base_odds:1
+
+    Returns:
+        pandas.DataFrame: Scorecard with feature names, attributes, points, and weights.
+        float: Base score.
+    """
+
+    n_feature = len(feature_names)
+    B_0 = model.intercept_[0]
+    factor = pdo / np.log(2)
+    offset = base_score - (factor*np.log(base_odd))
+    constant = offset/n_feature
+
+    scorecard = []
+
+    for icol in range(0,n_feature):
+        B_i = model.coef_[0][icol]
+        feature = feature_names[icol]
+        for Xi in np.sort(df[feature].unique())[::-1]:
+            contribution = -(((B_i * Xi) + (B_0/n_feature)) * factor) + constant
+            scorecard.append([feature, B_i, Xi, contribution])
+
+    return pd.DataFrame(scorecard, columns=['Feature', 'Weight', 'Attribute', 'Points'])
+
+
+def tune_logistic_regression(df, feature_columns, target_column, n_folds=5, C1_values=np.logspace(-4, 4, 20)):
+    # Split the dataframe into features and target
+
+    X = df[feature_columns]
+    y = df[target_column]
+
+    # Standardize the features
+    scaler = StandardScaler()
+    X_scaled = scaler.fit_transform(X)
+
+    # Set up the logistic regression model
+    log_reg = LogisticRegression(solver='liblinear', max_iter=1000)
+
+    # Define the hyperparameters to tune
+    param_grid = {
+        'C': C1_values,  # Regularization strength
+        'penalty': ['l2'],  # L1 and L2 regularization
+        'solver': ['liblinear']  # Solver compatible with L1
+    }
+
+    # Set up the stratified K-fold cross-validation
+    cv = StratifiedKFold(n_splits=n_folds, shuffle=True, random_state=42)
+
+    # Set up GridSearchCV with AUC-ROC as the scoring metric
+    grid_search = GridSearchCV(estimator=log_reg, param_grid=param_grid, cv=cv, scoring='roc_auc', n_jobs=-1)
+
+    # Fit the model using cross-validation
+    grid_search.fit(X_scaled, y)
+
+    # Get the best model from the grid search
+    best_model = grid_search.best_estimator_
+    best_param = grid_search.best_params_
+
+    # Create a DataFrame to summarize the grid search results
+    results = pd.DataFrame(grid_search.cv_results_)
+
+    # Extract the relevant columns: mean_test_score (AUC), C, and penalty
+    summary_df = results[['param_C', 'param_penalty', 'mean_test_score']]
+
+    # Rename columns for clarity
+    summary_df.columns = ['C_value', 'Penalty', 'ROC_AUC']
+
+    # Return the best model and the summary dataframe
+    return best_model, best_param, summary_df
 
 
 def calculate_woe(df, features, target_col, thresholds=None):
@@ -320,16 +577,16 @@ def calculate_woe(df, features, target_col, thresholds=None):
         for feature in features:
             # Get the threshold for the current feature
             threshold = thresholds[feature]
-            woe_df[feature] = pd.cut(df[feature], threshold,labels=False)
-            woe_df[feature] = woe_df[feature].fillna(-9999)
-            woe_df[feature] = woe_df[feature].astype('object')
+            woe_df[feature] = pd.cut(df[feature], threshold)
+            # woe_df[feature] = woe_df[feature].fillna(-9999)
+            woe_df[feature] = woe_df[feature].astype('str')
 
     else:
         for feature in features:
             dict_transformer = st.session_state.feat_cat_group[feature]
             woe_df[feature] = df[feature].map(dict_transformer)
-            woe_df[feature] = woe_df[feature].fillna('-9999')
-            woe_df[feature] = woe_df[feature].astype('object')
+            # woe_df[feature] = woe_df[feature].fillna('-9999')
+            woe_df[feature] = woe_df[feature].astype('str')
 
     woe_encoder = WoEEncoder()
     df_transformed = woe_encoder.fit_transform(woe_df[features], df[target_col])
@@ -347,39 +604,53 @@ def calculate_woe_all(df):
     features_cat = st.session_state.cols_feat_cat
     target_col = st.session_state.target_col
 
-    woe_df = pd.DataFrame()
+    woe_df = pd.DataFrame(index = df.index)
+    woe_cols = list()
 
     # Loop over each feature
+    if len(features_num) > 0:
+        for feature in features_num:
+            # Get the threshold for the current feature
+            threshold = thresholds[feature]
+            woe_df[feature] = pd.cut(df[feature], threshold, labels=False)
+            woe_df[feature] = woe_df[feature].astype('object')
 
-    for feature in features_num:
-        # Get the threshold for the current feature
-        threshold = thresholds[feature]
-        woe_df[feature] = pd.cut(df[feature], threshold, labels=False)
-        woe_df[feature] = woe_df[feature].astype('object')
+        woe_encoder = WoEEncoder()
+        woe_encoder.fit(woe_df.loc[train_mask, features_num], df.loc[train_mask, target_col])
+        woe_df_num = woe_encoder.transform(woe_df[features_num])
 
-    woe_encoder = WoEEncoder()
-    woe_encoder.fit(woe_df.loc[train_mask, features_num], df.loc[train_mask, target_col])
-    woe_df_num = woe_encoder.transform(woe_df[features_num])
+        for icol in woe_df_num.columns:
+            woe_df_num = woe_df_num.rename(columns={icol: icol + "_woe"})
 
-    woe_df = pd.DataFrame()
-    for feature in features_cat:
-        woe_df[feature] = df[feature].map(dict_group[feature])
-        woe_df[feature] = woe_df[feature].astype('object')
+        if set(woe_df_num.columns.tolist()).issubset(set(df.columns.tolist())):
+            df = df.drop(woe_df_num, axis='columns')
 
-    woe_encoder = WoEEncoder()
-    woe_encoder.fit(woe_df.loc[train_mask, features_cat], df.loc[train_mask, target_col])
-    woe_df_cat = woe_encoder.transform(woe_df[features_cat])
+        df = df.merge(woe_df_num, left_index=True, right_index=True, how='left')
 
-    for icol in woe_df_num.columns:
-        woe_df_num = woe_df_num.rename(columns={icol: icol+"_woe"})
+        woe_cols.extend(woe_df_num.columns.tolist())
 
-    for icol in woe_df_cat.columns:
-        woe_df_cat = woe_df_cat.rename(columns={icol: icol+"_woe"})
+    woe_df = pd.DataFrame(index = df.index)
 
-    df = df.merge(woe_df_num, left_index=True, right_index=True, how='left').merge(woe_df_cat, left_index=True, right_index=True, how='left')
-    return df
+    if len(features_cat) > 0:
+        for feature in features_cat:
+            woe_df[feature] = df[feature].map(dict_group[feature])
+            woe_df[feature] = woe_df[feature].astype('object')
 
 
+        woe_encoder = WoEEncoder()
+        woe_encoder.fit(woe_df.loc[train_mask, features_cat], df.loc[train_mask, target_col])
+        woe_df_cat = woe_encoder.transform(woe_df[features_cat])
+
+        for icol in woe_df_cat.columns:
+            woe_df_cat = woe_df_cat.rename(columns={icol: icol+"_woe"})
+
+        if set(woe_df_cat.columns.tolist()).issubset(set(df.columns.tolist())):
+            df = df.drop(woe_df_cat, axis='columns')
+
+        df = df.merge(woe_df_cat, left_index=True, right_index=True, how='left')
+        woe_cols.extend(woe_df_cat.columns.tolist())
+
+    return df, woe_cols
 
 
 def tune_woe(option):
@@ -398,16 +669,17 @@ def tune_woe(option):
         bin_new = st.text_input("Number of bin", value=st.session_state.feat_num_bin[option])
         bin_new = fix_bin(bin_new)
         st.session_state.feat_num_bin[option] = bin_new
-        grouped = calculate_woe_feature_num(df_used, option, st.session_state.target_col, bin_new)
+        grouped, woe_summary = calculate_woe_feature_num(df_used, option, st.session_state.target_col, bin_new)
 
 
     elif option in st.session_state.cols_feat_cat:
         bin_new = st.text_input("Number of bin", value=st.session_state.feat_cat_group[option])
         bin_new = ast.literal_eval(bin_new)
         st.session_state.feat_cat_group[option] = bin_new
-        grouped = calculate_woe_feature_cat(df_used, option, st.session_state.target_col, bin_new)
+        grouped, woe_summary = calculate_woe_feature_cat(df_used, option, st.session_state.target_col, bin_new)
 
     st.dataframe(grouped)
+    st.dataframe(woe_summary)
 
 
 def calculate_woe_feature_cat(df, feature, target, transform_dict):
@@ -430,8 +702,12 @@ def calculate_woe_feature_cat(df, feature, target, transform_dict):
     # Calculate WoE for each bin (bin values 0 and 1)
     grouped['WoE'] = np.log(grouped['good'] / grouped['bad'])
 
+    grouped = grouped.reset_index()
+
     # Print the WoE values
-    return grouped[['good', 'bad', 'sum', 'count', 'bad rate', 'WoE']]
+    return grouped[['data_type', 'binned_feature', 'good', 'bad', 'sum', 'count', 'bad rate']], grouped.loc[
+        grouped['data_type'] == 'train', ['binned_feature', 'good', 'bad', 'sum', 'count', 'bad rate', 'WoE']]
+
 
 def calculate_woe_feature_num(df, feature, target, threshold):
     # Create bins based on the threshold
@@ -453,8 +729,10 @@ def calculate_woe_feature_num(df, feature, target, threshold):
     # Calculate WoE for each bin (bin values 0 and 1)
     grouped['WoE'] = np.log(grouped['good'] / grouped['bad'])
 
+    grouped = grouped.reset_index()
+
     # Print the WoE values
-    return grouped[['good', 'bad', 'sum', 'count', 'bad rate', 'WoE']]
+    return grouped[['data_type', 'binned_feature', 'good', 'bad', 'sum', 'count', 'bad rate']], grouped.loc[grouped['data_type']=='train', ['binned_feature', 'good', 'bad', 'sum', 'count', 'bad rate', 'WoE']]
 
 def fix_bin(bin_list):
     txt_list = bin_list.split(",")
